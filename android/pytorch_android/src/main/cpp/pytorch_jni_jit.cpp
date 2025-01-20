@@ -17,11 +17,6 @@
 #include <android/asset_manager.h>
 #include <android/asset_manager_jni.h>
 #include <android/log.h>
-
-#ifndef USE_PTHREADPOOL
-#define USE_PTHREADPOOL
-#endif /* USE_PTHREADPOOL */
-#include <caffe2/utils/threadpool/pthreadpool-cpp.h>
 #endif
 
 namespace pytorch_jni {
@@ -124,7 +119,7 @@ class PytorchJni : public facebook::jni::HybridClass<PytorchJni> {
     }
     deviceType_ = deviceJniCodeToDeviceType(device);
     module_ = torch::jit::load(
-        std::move(modelPath->toStdString()), c10::nullopt, extra_files);
+        std::move(modelPath->toStdString()), std::nullopt, extra_files);
     if (has_extra) {
       static auto putMethod =
           facebook::jni::JMap<facebook::jni::JString, facebook::jni::JString>::
@@ -239,34 +234,6 @@ class PytorchJni : public facebook::jni::HybridClass<PytorchJni> {
         methodName.c_str());
   }
 };
-
-#if defined(__ANDROID__)
-class PyTorchAndroidJni : public facebook::jni::JavaClass<PyTorchAndroidJni> {
- public:
-  constexpr static auto kJavaDescriptor = "Lorg/pytorch/PyTorchAndroid;";
-
-  static void registerNatives() {
-    javaClassStatic()->registerNatives({
-        makeNativeMethod(
-            "nativeSetNumThreads", PyTorchAndroidJni::setNumThreads),
-    });
-  }
-
-  static void setNumThreads(facebook::jni::alias_ref<jclass>, jint numThreads) {
-    caffe2::pthreadpool()->set_thread_count(numThreads);
-  }
-};
-#endif
-
-void common_registerNatives() {
-  static const int once = []() {
-#if defined(__ANDROID__)
-    pytorch_jni::PyTorchAndroidJni::registerNatives();
-#endif
-    return 0;
-  }();
-  ((void)once);
-}
 
 } // namespace pytorch_jni
 

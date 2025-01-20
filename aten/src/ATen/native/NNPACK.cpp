@@ -3,6 +3,7 @@
 #include <ATen/Config.h>
 
 #include <c10/util/CallOnce.h>
+#include <c10/util/error.h>
 
 #include <thread>
 
@@ -18,12 +19,11 @@
 
 #if !AT_NNPACK_ENABLED()
 
-namespace at {
-namespace native {
+namespace at::native {
 
 at::Tensor _nnpack_spatial_convolution(
     const Tensor& input,
-    const Tensor& weight, const c10::optional<Tensor>& bias_opt,
+    const Tensor& weight, const std::optional<Tensor>& bias_opt,
     const IntArrayRef padding,
     const IntArrayRef stride) {
   throw std::runtime_error(
@@ -34,8 +34,7 @@ bool _nnpack_available() {
   return false;
 }
 
-} // namespace native
-} // namespace at
+} // namespace at::native
 
 #else
 
@@ -46,8 +45,7 @@ bool _nnpack_available() {
 #include <ATen/Parallel.h>
 #include <c10/util/irange.h>
 
-namespace at {
-namespace native {
+namespace at::native {
 
 static bool init_nnpack() {
   static c10::once_flag once_;
@@ -123,7 +121,7 @@ struct Workspace {
     // Won't work on Windows, but NNPACK doesn't support Windows either
     auto res = posix_memalign(&buffer, nnpack_memory_alignment_boundary, size);
     if (res != 0) {
-      TORCH_CHECK(false, "posix_memalign failed:", strerror(errno), " (", errno, ")");
+      TORCH_CHECK(false, "posix_memalign failed:", c10::utils::str_error(errno), " (", errno, ")");
     }
     return;
   }
@@ -140,7 +138,7 @@ static thread_local Workspace workspace;
 
 Tensor _nnpack_spatial_convolution(
     const Tensor& input,
-    const Tensor& weight, const c10::optional<Tensor>& bias_opt,
+    const Tensor& weight, const std::optional<Tensor>& bias_opt,
     const IntArrayRef padding,
     const IntArrayRef stride) {
   // See [Note: hacky wrapper removal for optional tensor]
@@ -320,7 +318,6 @@ Tensor _nnpack_spatial_convolution(
   return output;
 }
 
-} // namespace native
-} // namespace at
+} // namespace at::native
 
 #endif // AT_NNPACK_ENABLED

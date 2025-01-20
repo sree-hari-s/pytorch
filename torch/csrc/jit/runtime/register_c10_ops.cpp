@@ -4,7 +4,6 @@
 #include <torch/csrc/jit/frontend/tracer.h>
 #include <torch/csrc/jit/ir/ir.h>
 #include <torch/csrc/jit/runtime/operator.h>
-#include <unordered_set>
 
 namespace torch::jit {
 
@@ -53,7 +52,7 @@ Registerer& registerer() {
 }
 
 // global instance to run its constructor on startup
-C10_UNUSED Registerer& dummy = registerer();
+[[maybe_unused]] Registerer& dummy = registerer();
 
 } // namespace
 

@@ -13,7 +13,7 @@
 namespace torch {
 namespace jit {
 
-static constexpr c10::string_view moduleInterfaceSrc = R"JIT(
+static constexpr std::string_view moduleInterfaceSrc = R"JIT(
 class OneInterface(ModuleInterface):
     def one(self, x: Tensor, y: Tensor) -> Tensor:
         pass
@@ -77,7 +77,7 @@ TEST(ModuleAPITest, MethodRunAsync) {
 
   future->wait();
 
-  // expect 2 forks and 2 wait callbacks being excuted on provided taskLauncher
+  // expect 2 forks and 2 wait callbacks being executed on provided taskLauncher
   // but ivalue::Future would be marked completed and release wait before
   // finishing all callbacks
   ASSERT_GE(counter, 2);

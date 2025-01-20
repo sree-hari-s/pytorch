@@ -1,7 +1,12 @@
+.. meta::
+   :description: A guide to torch.cuda, a PyTorch module to run CUDA operations
+   :keywords: memory management, PYTORCH_CUDA_ALLOC_CONF, optimize PyTorch, CUDA
+
 .. _cuda-semantics:
 
 CUDA semantics
 ==============
+
 
 :mod:`torch.cuda` is used to set up and run CUDA operations. It keeps track of
 the currently selected GPU, and all CUDA tensors you allocate will by default be
@@ -56,13 +61,13 @@ Below you can find a small example showcasing this::
 
 .. _tf32_on_ampere:
 
-TensorFloat-32(TF32) on Ampere devices
---------------------------------------
+TensorFloat-32 (TF32) on Ampere (and later) devices
+---------------------------------------------------
 
 Starting in PyTorch 1.7, there is a new flag called `allow_tf32`. This flag
 defaults to True in PyTorch 1.7 to PyTorch 1.11, and False in PyTorch 1.12 and later.
 This flag controls whether PyTorch is allowed to use the TensorFloat32 (TF32) tensor cores,
-available on new NVIDIA GPUs since Ampere, internally to compute matmul (matrix multiplies
+available on NVIDIA GPUs since Ampere, internally to compute matmul (matrix multiplies
 and batched matrix multiplies) and convolutions.
 
 TF32 tensor cores are designed to achieve better performance on matmul and convolutions on
@@ -80,11 +85,12 @@ matmuls and convolutions are controlled separately, and their corresponding flag
   # The flag below controls whether to allow TF32 on cuDNN. This flag defaults to True.
   torch.backends.cudnn.allow_tf32 = True
 
+The precision of matmuls can also be set more broadly (limited not just to CUDA) via :meth:`~torch.set_float_32_matmul_precision`.
 Note that besides matmuls and convolutions themselves, functions and nn modules that internally uses
 matmuls or convolutions are also affected. These include `nn.Linear`, `nn.Conv*`, cdist, tensordot,
 affine grid and grid sample, adaptive log softmax, GRU and LSTM.
 
-To get an idea of the precision and speed, see the example code below:
+To get an idea of the precision and speed, see the example code and benchmark data (on A100) below:
 
 .. code:: python
 
@@ -108,9 +114,12 @@ To get an idea of the precision and speed, see the example code below:
   error = (ab_fp32 - ab_full).abs().max()  # 0.0031
   relative_error = error / mean  # 0.000039
 
-From the above example, we can see that with TF32 enabled, the speed is ~7x faster, relative error
-compared to double precision is approximately 2 orders of magnitude larger.  If full FP32 precision
-is needed, users can disable TF32 by:
+From the above example, we can see that with TF32 enabled, the speed is ~7x faster on A100, and that
+relative error compared to double precision is approximately 2 orders of magnitude larger. Note that
+the exact ratio of TF32 to single precision speed depends on the hardware generation, as properties
+such as the ratio of memory bandwidth to compute as well as the ratio of TF32 to FP32 matmul throughput
+may vary from generation to generation or model to model.
+If full FP32 precision is needed, users can disable TF32 by:
 
 .. code:: python
 
@@ -260,7 +269,42 @@ used.  For example, the following code is incorrect::
 When the "current stream" is the default stream, PyTorch automatically performs
 necessary synchronization when data is moved around, as explained above.
 However, when using non-default streams, it is the user's responsibility to
-ensure proper synchronization.
+ensure proper synchronization.  The fixed version of this example is::
+
+    cuda = torch.device('cuda')
+    s = torch.cuda.Stream()  # Create a new stream.
+    A = torch.empty((100, 100), device=cuda).normal_(0.0, 1.0)
+    s.wait_stream(torch.cuda.default_stream(cuda))  # NEW!
+    with torch.cuda.stream(s):
+        B = torch.sum(A)
+    A.record_stream(s)  # NEW!
+
+There are two new additions.  The :meth:`torch.cuda.Stream.wait_stream` call
+ensures that the ``normal_()`` execution has finished before we start running
+``sum(A)`` on a side stream.  The :meth:`torch.Tensor.record_stream` (see for
+more details) ensures that we do not deallocate A before ``sum(A)`` has
+completed.  You can also manually wait on the stream at some later point in
+time with ``torch.cuda.default_stream(cuda).wait_stream(s)`` (note that it
+is pointless to wait immediately, since that will prevent the stream execution
+from running in parallel with other work on the default stream.)  See the
+documentation for :meth:`torch.Tensor.record_stream` on more details on when
+to use one or another.
+
+Note that this synchronization is necessary even when there is no
+read dependency, e.g., as seen in this example::
+
+    cuda = torch.device('cuda')
+    s = torch.cuda.Stream()  # Create a new stream.
+    A = torch.empty((100, 100), device=cuda)
+    s.wait_stream(torch.cuda.default_stream(cuda))  # STILL REQUIRED!
+    with torch.cuda.stream(s):
+        A.normal_(0.0, 1.0)
+        A.record_stream(s)
+
+Despite the computation on ``s`` not reading the contents of ``A`` and no
+other uses of ``A``, it is still necessary to synchronize, because ``A``
+may correspond to memory reallocated by the CUDA caching allocator, with
+pending operations from the old (deallocated) memory.
 
 .. _bwd-cuda-stream-semantics:
 
@@ -376,8 +420,8 @@ underlying allocation patterns produced by your code.
 
 .. _cuda-memory-envvars:
 
-Environment variables
-^^^^^^^^^^^^^^^^^^^^^
+Optimizing memory usage  with ``PYTORCH_CUDA_ALLOC_CONF``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Use of a caching allocator can interfere with memory checking tools such as
 ``cuda-memcheck``.  To debug memory errors using ``cuda-memcheck``, set
@@ -427,6 +471,13 @@ Available options:
   set the knob value to: [256:1,512:2,1024:4,>:8].
   ``roundup_power2_divisions`` is only meaningful with ``backend:native``.
   With ``backend:cudaMallocAsync``, ``roundup_power2_divisions`` is ignored.
+* ``max_non_split_rounding_mb`` will allow non-split blocks for better reuse, eg,
+   a 1024MB cached block can be re-used for a 512MB allocation request. In the default
+   case, we only allow up to 20MB of rounding of non-split blocks, so a 512MB block
+   can only be served with between 512-532 MB size block. If we set the value of this
+   option to 1024, it will alow 512-1536 MB size blocks to be used for a 512MB block
+   which increases reuse of larger blocks. This will also help in reducing the stalls
+   in avoiding expensive cudaMalloc calls.
 * ``garbage_collection_threshold`` helps actively reclaiming unused GPU memory to
   avoid triggering expensive sync-and-reclaim-all operation (release_cached_blocks),
   which can be unfavorable to latency-critical GPU applications (e.g., servers).
@@ -482,6 +533,10 @@ Available options:
   using more threads to parallelize the page mapping operations to reduce the overall
   allocation time of pinned memory. A good value for this option is 8 based on
   benchmarking results.
+
+  `pinned_use_background_threads` option is a boolean flag to enable background thread
+  for processing events. This avoids any slow path associated with querying/processing of
+  events in the fast allocation path. This feature is disabled by default.
 
 .. note::
 
@@ -932,9 +987,12 @@ Violating any of these will likely cause a runtime error:
   :class:`~torch.cuda.graph` and
   :func:`~torch.cuda.make_graphed_callables` set a side stream for you.)
 * Ops that synchronize the CPU with the GPU (e.g., ``.item()`` calls) are prohibited.
-* CUDA RNG ops are allowed, but must use default generators. For example, explicitly constructing a
-  new :class:`torch.Generator` instance and passing it as the ``generator`` argument to an RNG function
-  is prohibited.
+* CUDA RNG operations are permitted, and when using multiple :class:`torch.Generator` instances within a graph,
+  they must be registered using :meth:`CUDAGraph.register_generator_state<torch.cuda.CUDAGraph.register_generator_state>` before graph capture.
+  Avoid using :meth:`Generator.get_state<torch.get_state>` and :meth:`Generator.set_state<torch.set_state>` during capture;
+  instead, utilize :meth:`Generator.graphsafe_set_state<torch.Generator.graphsafe_set_state>` and :meth:`Generator.graphsafe_get_state<torch.Generator.graphsafe_get_state>`
+  for managing generator states safely within the graph context. This ensures proper RNG operation and generator management within CUDA graphs.
+
 
 Violating any of these will likely cause silent numerical errors or undefined behavior:
 

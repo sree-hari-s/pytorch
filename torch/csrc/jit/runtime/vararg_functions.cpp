@@ -106,6 +106,11 @@ void tupleUnpack(Stack& stack) {
 }
 
 void format(Stack& stack, size_t num_inputs) {
+  TORCH_CHECK(
+      num_inputs > 0 && num_inputs <= stack.size(),
+      "Invalid number of inputs for format string: ",
+      num_inputs);
+
   // static const std::regex unsupported_options("\\{(.*?)\\}");
   auto format = peek(stack, 0, num_inputs).toStringRef();
   // // Temporally comment out the warning message because of
@@ -125,7 +130,7 @@ void format(Stack& stack, size_t num_inputs) {
     }
     ss << format.substr(begin, loc - begin);
     if (used_args >= args.size()) {
-      AT_ERROR("Too few arguments for format string: ", format);
+      TORCH_CHECK(false, "Too few arguments for format string: ", format);
     }
     ss << args[used_args];
     begin = loc + 2;
