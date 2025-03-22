@@ -2120,6 +2120,7 @@ class FakeTensorMode(TorchDispatchMode):
             and len(flat_arg_fake_tensors) != 0
             and not has_symbolic_sizes
             and not avoiding_device_init
+            and func is not aten._nested_tensor_from_tensor_list.default
         ):
             const_flat_args = [
                 a.constant if self.is_our_fake(a) else a for a in flat_args
@@ -2201,7 +2202,17 @@ class FakeTensorMode(TorchDispatchMode):
                     func, real_flat_args, args_spec
                 )
 
-            real_out = func(*real_args, **real_kwargs)
+            try:
+                real_out = func(*real_args, **real_kwargs)
+            except ZeroDivisionError as exc:
+                # we shouldn't broadly catch all errors here;
+                # some come from real-kernel mutation/aliasing checks we want to run.
+                # add more exception types as needed.
+                log.debug(
+                    "real-tensor fallback failed for %s: %s; silently ignoring",
+                    func,
+                    exc,
+                )
 
             if not is_builtin:
                 mutation_checker.check()  # type: ignore[possibly-undefined]

@@ -43,6 +43,7 @@ from ..utils import (
     is_welford_reduction,
     parallel_num_threads,
     Placeholder,
+    set_kernel_post_grad_provenance_tracing,
     sympy_index_symbol,
     sympy_index_symbol_with_prefix,
     sympy_product,
@@ -71,6 +72,7 @@ from .cpp_utils import (
     codegen_rand,
     CppCSEVariable,
     DTYPE_TO_CPP,
+    get_promote_dtype,
     INDEX_TYPE,
     LocalBufferContext,
     may_unify_binary_op_mask_type,
@@ -84,6 +86,7 @@ from .cpp_utils import (
 _IS_WINDOWS = sys.platform == "win32"
 
 
+@functools.lru_cache(None)
 def get_export_declaration():
     return "__declspec(dllexport)" if _IS_WINDOWS else ""
 
@@ -441,6 +444,17 @@ def stride_at_vec_range(
     return stride_at(index, var)
 
 
+@dataclasses.dataclass
+class ParallelDepth:
+    """
+    A class representing parallel depth.
+    Includes the starting depth of parallelism and the depth of parallelism.
+    """
+
+    parallel_depth: int
+    start_depth: int
+
+
 class OuterLoopFusedSchedulerNode(FusedSchedulerNode):
     @classmethod
     def fuse(  # type: ignore[override]
@@ -634,20 +648,31 @@ class RecordOptimizationContext:
         return self.current_node
 
 
+def decltype_promoted(*args):
+    assert not any(isinstance(arg, CppCSEVariable) and arg.is_vec for arg in args), (
+        "Promotion of vector types is not supported"
+    )
+
+    if (dt := get_promote_dtype(args)) is not None:
+        return DTYPE_TO_CPP[dt]
+    else:
+        return f"decltype({args[0]})"
+
+
 class CppOverrides(OpOverrides):
     """Map element-wise ops to C++"""
 
     @staticmethod
     def add(a, b):
-        return f"decltype({a})({a} + {b})"
+        return f"{decltype_promoted(a, b)}({a} + {b})"
 
     @staticmethod
     def sub(a, b):
-        return f"decltype({a})({a} - {b})"
+        return f"{decltype_promoted(a, b)}({a} - {b})"
 
     @staticmethod
     def mul(a, b):
-        return f"decltype({a})({a} * {b})"
+        return f"{decltype_promoted(a, b)}({a} * {b})"
 
     @staticmethod
     def to_dtype(x, dtype, src_dtype=None, use_compute_types=True):
@@ -1395,10 +1420,7 @@ class CppVecOverrides(CppOverrides):
 
     @staticmethod
     def tanh(a):
-        vec_one = f"decltype({a})(1)"
-        vec_two = f"decltype({a})(2)"
-        vec_minus_two = f"decltype({a})(-2)"
-        return f"{vec_two} / ({vec_one} + ({vec_minus_two} * {a}).exp()) - {vec_one}"
+        return f"{a}.tanh()"
 
     @staticmethod
     def reciprocal(a):
@@ -1872,9 +1894,10 @@ class CppKernel(Kernel):
         self.local_reduction_stores = IndentedBuffer()
         self.is_reduction = False
         self.non_parallel_reduction_prefix = IndentedBuffer()
+        self.non_parallel_reduction_suffix = IndentedBuffer()
         self.reduction_cse = CSE(self.newvar_prefix, self.suffix, name_prefix="tmp_acc")
-        self.weight_recps_cse = CSE(
-            self.newvar_prefix, self.suffix, name_prefix="wrecps"
+        self.welford_helper_cse = CSE(
+            self.newvar_prefix, self.suffix, name_prefix="welford_helper"
         )
         self.preloads = IndentedBuffer()
         self.poststores = IndentedBuffer()
@@ -2036,7 +2059,7 @@ class CppKernel(Kernel):
         var = self.args.input(name)
         index = self.rename_indexing(index)
         line = f"{var}[{cexpr_index(index)}]"
-        csevar = self.cse.generate(self.loads, line)
+        csevar = self.cse.generate(self.loads, line, dtype=V.graph.get_dtype(name))
         csevar.update_on_args("load", (self, name, index), {})
         return csevar
 
@@ -2167,10 +2190,13 @@ class CppKernel(Kernel):
                 loop_nest.max_parallel_depth(), threads
             )
 
-        is_reduction_only = loop_nest.is_reduction_only()
+        is_reduction_loop = (
+            loop_nest.loops is not None
+            and loop_nest.loops[par_depth.start_depth].is_reduction
+        )
         with contextlib.ExitStack() as stack:
-            if par_depth:
-                if loop_nest.is_reduction_only():
+            if par_depth.parallel_depth:
+                if is_reduction_loop:
                     # need to close the worksharing scope to define reduction vars outside it
                     worksharing.close()
                 else:
@@ -2183,7 +2209,7 @@ class CppKernel(Kernel):
             def gen_kernel(_loop_nest: LoopNest):
                 def is_parallel_reduction():
                     assert _loop_nest.loops
-                    root = _loop_nest.loops[0]
+                    root = _loop_nest.loops[par_depth.start_depth]
                     return root.is_reduction and root.parallel
 
                 kernel = _loop_nest.get_kernel()
@@ -2203,6 +2229,8 @@ class CppKernel(Kernel):
                     suffix = kernel.reduction_suffix
                     if parallel:
                         suffix = kernel.parallel_reduction_suffix + suffix
+                    else:
+                        suffix = kernel.non_parallel_reduction_suffix + suffix
                     return suffix
                 else:
                     prefix = kernel.reduction_prefix
@@ -2226,7 +2254,7 @@ class CppKernel(Kernel):
                         if reduction_prefix:
                             stack_outer.enter_context(code.indent())
                         code.splice(reduction_prefix)
-                    if is_reduction_only and loop.parallel:
+                    if is_reduction_loop and loop.parallel:
                         worksharing.parallel(threads)
                         if kernel.local_reduction_init:
                             assert kernel.local_reduction_stores
@@ -2234,7 +2262,7 @@ class CppKernel(Kernel):
 
                     gen_loop_at(_loop_nest, depth)
 
-                    if is_reduction_only and loop.parallel:
+                    if is_reduction_loop and loop.parallel:
                         if kernel.local_reduction_stores:
                             code.splice(kernel.local_reduction_stores)
                         worksharing.close()
@@ -2307,7 +2335,11 @@ class CppKernel(Kernel):
 
     def decide_parallel_depth(self, max_parallel_depth, threads):
         assert self.call_ranges is not None
-        ranges = self.call_ranges[:max_parallel_depth]
+        ranges = self.call_ranges[
+            max_parallel_depth.start_depth : (
+                max_parallel_depth.start_depth + max_parallel_depth.parallel_depth
+            )
+        ]
         seq = self.size_hint()
         par = 1
         depth = 0
@@ -2326,7 +2358,9 @@ class CppKernel(Kernel):
         # to manage the serial vs. parallel.
         if config.cpp.dynamic_threads and depth == 0 and len(ranges) > 0:
             depth = 1
-        return depth
+        return ParallelDepth(
+            parallel_depth=depth, start_depth=max_parallel_depth.start_depth
+        )
 
     @contextlib.contextmanager
     def write_to_suffix(self):
@@ -2638,7 +2672,7 @@ class CppVecKernel(CppKernel):
             buffer.splice(code)
             return None
         else:
-            csevar = self.cse.generate(buffer, code)
+            csevar = self.cse.generate(buffer, code, dtype=dtype)
             assert isinstance(csevar, CppCSEVariable)
             csevar.is_vec = True
             return csevar
@@ -2655,7 +2689,7 @@ class CppVecKernel(CppKernel):
         elif stride == 1:
             # load contiguously
             line = self._get_vec_load_line(var, index, dtype, self._load_mask)  # type: ignore[arg-type]
-            csevar = self.cse.generate(self.loads, line)  # type: ignore[assignment]
+            csevar = self.cse.generate(self.loads, line, dtype=dtype)  # type: ignore[assignment]
         else:
             csevar = self._load_or_store_non_contiguous(var, index, dtype)  # type: ignore[assignment]
         assert isinstance(csevar, CppCSEVariable)
@@ -2783,12 +2817,7 @@ class CppVecKernel(CppKernel):
                 self.reduction_init_vec,
             )
         )
-        reduction_size = functools.reduce(
-            lambda x, y: x * y, self.ranges[self.reduction_depth :]
-        )
         if reduction_type == "welford_reduce":
-            # save the reciprocal of weights for welford reduce
-            assert self.reduction_depth is not None
             # use masked acc_vec for tail vec kernel
             self.reduction_prefix_generators.append(
                 self._gen_reduction_prefix(
@@ -2799,40 +2828,52 @@ class CppVecKernel(CppKernel):
                     self.reduction_init_vec,
                 )
             )
+
+            # use welford_helper for vec kernel
+            assert self.reduction_depth is not None
             reduction_size = functools.reduce(
                 lambda x, y: x * y, self.ranges[self.reduction_depth :]
             )
-            reduction_factor = (
-                self.tiling_factor if self.tiling_idx >= self.reduction_depth else 1
+            welford_helper_val = self.welford_helper_cse.generate(
+                self.compute, f"reduction {reduction_key}", write=False
             )
-            self.weight_recp_vec_range = FloorDiv(reduction_size, reduction_factor)
-            if self.weight_recp_vec_range not in self.weight_recps_cse.reduction_cache:
-                self.weight_recps_val = self.weight_recps_cse.generate(
-                    self.compute, f"reduction {self.weight_recp_vec_range}", write=False
+            masked_welford_helper_val = f"masked_{welford_helper_val}"
+            welford_helper_vec_range = (
+                (
+                    FloorDiv(reduction_size, self.ranges[self.tiling_idx])
+                    * FloorDiv(self.ranges[self.tiling_idx], self.tiling_factor)
+                    if self.tiling_idx >= self.reduction_depth
+                    else reduction_size
                 )
-                self.weight_recps_cse.reduction_cache[self.weight_recp_vec_range] = (
-                    self.weight_recps_val
+                if FloorDiv(self.ranges[self.tiling_idx], self.tiling_factor)
+                else sympy.Integer(0)
+            )
+            masked_welford_helper_vec_range = (
+                (
+                    FloorDiv(reduction_size, self.ranges[self.tiling_idx])
+                    if self.tiling_idx >= self.reduction_depth
+                    else reduction_size
                 )
-                self.non_parallel_reduction_prefix.writeline(
-                    self.welford_weight_reciprocal_vec(dtype)
-                )
-                # generate weight_recps for parallel reduction
-                num_threads = (
-                    "max_threads"
-                    if config.cpp.dynamic_threads
-                    else parallel_num_threads()
-                )
-                self.local_reduction_init.writeline(
-                    self.welford_weight_reciprocal_vec(dtype, num_threads)
-                )
-            else:
-                self.weight_recps_val = self.weight_recps_cse.reduction_cache[
-                    self.weight_recp_vec_range
-                ]
+                if self.ranges[self.tiling_idx] % self.tiling_factor
+                else sympy.Integer(0)
+            )
+            self._use_welford_helper(
+                acc_vec, welford_helper_val, welford_helper_vec_range, dtype
+            )
+            self._use_welford_helper(
+                masked_acc_vec,
+                masked_welford_helper_val,
+                masked_welford_helper_vec_range,
+                dtype,
+            )
+
             # use masked acc_vec for tail vec kernel
             acc_vec_ = masked_acc_vec if self.tail_size else acc_vec
+            welford_helper_val_ = (
+                masked_welford_helper_val if self.tail_size else welford_helper_val
+            )
             self.stores.writeline(
-                f"{acc_vec_} = {self.reduction_combine_vec(reduction_type, acc_vec_, value, True)};"
+                f"{acc_vec_} = {self.reduction_combine_vec(reduction_type, acc_vec_, value, welford_helper_val_)};"
             )
         else:
             assert self.reduction_depth is not None
@@ -3047,18 +3088,51 @@ class CppVecKernel(CppKernel):
             return f"{self._get_mask_type()}"
         return vec_type
 
-    def welford_weight_reciprocal_vec(self, dtype, num_threads=None):
+    def _welford_helper_init(
+        self, welford_helper_val, welford_helper_vec_range, dtype, num_threads=None
+    ):
         vec_num_range_thread = (
-            CeilDiv(self.weight_recp_vec_range, num_threads)
+            CeilDiv(welford_helper_vec_range, num_threads)
             if num_threads
-            else self.weight_recp_vec_range
+            else welford_helper_vec_range
         )
         vec_num_range_thread_expr = cexpr_index(vec_num_range_thread)
-        return (
-            f"static WeightRecp<{self._get_vec_type(dtype)}> {self.weight_recps_val}"
+        chunk_size = 4096
+        num_chunks = CeilDiv(vec_num_range_thread, chunk_size)
+        welford_helper_init_line = (
+            f"WelfordHelper<{self._get_vec_type(dtype)}, {chunk_size}> {welford_helper_val}"
             f"("
             f"{vec_num_range_thread_expr}"
             f");"
+        )
+        if isinstance(num_chunks, sympy.Integer) and num_chunks <= 1:
+            # When the number of chunks <= 1, there is no need to use cascade summation to improve
+            # reduction accuracy. We can initialize a static WelfordHelper to improve performance.
+            return f"static {welford_helper_init_line}"
+        else:
+            return welford_helper_init_line
+
+    def _use_welford_helper(
+        self, acc_vec, welford_helper_val, welford_helper_vec_range, dtype
+    ):
+        num_threads = (
+            "max_threads" if config.cpp.dynamic_threads else parallel_num_threads()
+        )
+        self.non_parallel_reduction_prefix.writeline(
+            self._welford_helper_init(
+                welford_helper_val, welford_helper_vec_range, dtype
+            )
+        )
+        self.local_reduction_init.writeline(
+            self._welford_helper_init(
+                welford_helper_val, welford_helper_vec_range, dtype, num_threads
+            )
+        )
+        self.non_parallel_reduction_suffix.writeline(
+            f"{acc_vec} = welford_combine({acc_vec}, &{welford_helper_val});"
+        )
+        self.local_reduction_stores.writeline(
+            f"{acc_vec}_local = welford_combine({acc_vec}_local, &{welford_helper_val});"
         )
 
     def reduction_combine_vec(
@@ -3066,7 +3140,7 @@ class CppVecKernel(CppKernel):
         reduction_type,
         var,
         next_value,
-        use_weight_recps=False,
+        welford_helper_val=None,
         index: Optional[sympy.Symbol] = None,
         horizontal_reduction: Optional[bool] = None,
         src_dtype: Optional[torch.dtype] = torch.float32,
@@ -3107,11 +3181,13 @@ class CppVecKernel(CppKernel):
             else:
                 return f"{var} ^ {next_value}"
         elif reduction_type == "welford_reduce":
-            if use_weight_recps:
+            if welford_helper_val:
                 if self.tail_size:
-                    return f"welford_combine({var}, {next_value}, {cexpr_index(self.tail_size)}, &{self.weight_recps_val})"
+                    return f"welford_combine({var}, {next_value}, {cexpr_index(self.tail_size)}, &{welford_helper_val})"
                 else:
-                    return f"welford_combine({var}, {next_value}, &{self.weight_recps_val})"
+                    return (
+                        f"welford_combine({var}, {next_value}, &{welford_helper_val})"
+                    )
             else:
                 if self.tail_size:
                     return f"welford_combine({var}, {next_value}, {cexpr_index(self.tail_size)})"
@@ -3359,7 +3435,7 @@ class CppTile2DKernel(CppVecKernel):
             loadbuf = f"{tile_var} + {cexpr_index(inner * self.num_elems)}"
             dtype = V.graph.get_dtype(name)
             line = self._get_vec_load_line(loadbuf, 0, dtype)  # type: ignore[arg-type]
-            csevar = self.cse.generate(self.loads, line)
+            csevar = self.cse.generate(self.loads, line, dtype=dtype)
             csevar.update_on_args("load", (self, name, index), {})
             assert isinstance(csevar, CppCSEVariable)
             csevar.is_vec = True
@@ -4304,6 +4380,9 @@ class CppKernelProxy(CppKernel):
         self.non_parallel_reduction_prefix.splice(
             main_kernel.non_parallel_reduction_prefix
         )
+        self.non_parallel_reduction_suffix.splice(
+            main_kernel.non_parallel_reduction_suffix
+        )
 
 
 class OuterLoopFusedKernel(CppKernel):
@@ -4311,22 +4390,33 @@ class OuterLoopFusedKernel(CppKernel):
         super().__init__(kernel_group.args, kernel_group.ws.num_threads)
         self.inner: list[LoopNest] = []
 
-    def decide_parallel_depth(self, max_parallel_depth, threads) -> int:
+    def decide_parallel_depth(self, max_parallel_depth, threads):
         kernels_parallel_depth = []
         nested_kernels: list[CppKernel] = [
             loop_nest.get_kernel() for loop_nest in self.inner
         ]
+        # TODO(leslie-fang-intel): only enable parallel within all outer loop levels.
         for kernel in nested_kernels:
             # For any ScalarKernel, VecKernel, or Tile2DKernel,
             # they should all have the same call_ranges
             call_ranges = kernel.call_ranges
             assert call_ranges is not None
             kernels_parallel_depth.append(
-                kernel.decide_parallel_depth(len(call_ranges), threads)
+                kernel.decide_parallel_depth(
+                    ParallelDepth(
+                        parallel_depth=(
+                            len(call_ranges) - max_parallel_depth.start_depth
+                        ),
+                        start_depth=max_parallel_depth.start_depth,
+                    ),
+                    threads,
+                ).parallel_depth
             )
-        return min(
-            max_parallel_depth,
-            max(kernels_parallel_depth),
+        return ParallelDepth(
+            parallel_depth=min(
+                max_parallel_depth.parallel_depth, max(kernels_parallel_depth)
+            ),
+            start_depth=max_parallel_depth.start_depth,
         )
 
 
@@ -4365,13 +4455,7 @@ class CppScheduling(BaseScheduling):
         return tuple(tuple(map(V.graph.sizevars.simplify, s)) for s in sizes)
 
     def reset_kernel_group(self):
-        from .cpp_wrapper_cpu import CppWrapperCpu
-
-        self.kernel_group: Union[CppWrapperKernelGroup, KernelGroup]
-        if isinstance(V.graph.wrapper_code, CppWrapperCpu):
-            self.kernel_group = CppWrapperKernelGroup()
-        else:
-            self.kernel_group = KernelGroup()
+        self.kernel_group = KernelGroup()
 
     def fuse(self, node1, node2):
         if node1.is_foreach() or node2.is_foreach():
@@ -4681,6 +4765,8 @@ class CppScheduling(BaseScheduling):
             assert isinstance(node.node, ir.ComputedBuffer)
             _, original_body, _ = node.node.get_default_sizes_body()
             for name, expr in original_body.indexing_exprs.items():
+                if not isinstance(expr, sympy.Expr):
+                    continue
                 for div_expr in expr.find(FloorDiv):
                     if (
                         any(div_expr.has(var) for var in original_body.iter_vars)
@@ -4925,7 +5011,7 @@ class CppScheduling(BaseScheduling):
                 )
                 kernel_group.finalize_kernel(
                     outer_fusion_cpp_kernel_proxy,
-                    [_node for _nodes in nodes_list for _node in _nodes],
+                    [*itertools.chain.from_iterable(nodes_list)],
                 )
 
             return True
@@ -5077,12 +5163,22 @@ class CppScheduling(BaseScheduling):
             else ""
         )
         kernel_name = "_".join(["cpp", fused_name, wrapper.next_kernel_suffix()])
+        # below add provenance tracing info for cpu CppKernel types
+        if config.trace.enabled:
+            set_kernel_post_grad_provenance_tracing(nodes, kernel_name)
+
         kernel_decl_name = kernel_name if V.graph.cpp_wrapper else "kernel"
         src_code = src_code.replace(str(Placeholder.KERNEL_NAME), kernel_decl_name)
         src_code = src_code.replace(str(Placeholder.DESCRIPTIVE_NAME), kernel_name)
         # TODO(voz): Ostensibly, we should not need this. But there are cases where C++ codegen does
         # not use BracesBuffer, so we have no good indicator of a C++ buffer atm.
         src_code = src_code.replace("#pragma CMT", "//")
+
+        # Get the lines in the source code representing the function definition,
+        # excluding the the first line including cpp_prefix.h.
+        first_char = src_code.rfind('extern "C"')
+        last_char = src_code.find(")", first_char)
+        kernel_definition = f"{src_code[first_char : last_char + 1]};\n"
 
         compile_wrapper = IndentedBuffer()
         args = self.kernel_group.args if kernel_args is None else kernel_args
@@ -5092,7 +5188,12 @@ class CppScheduling(BaseScheduling):
         compile_wrapper.splice(src_code, strip=True)
         if not V.graph.cpp_wrapper:
             compile_wrapper.writeline("''')")
-        wrapper.define_kernel(kernel_name, compile_wrapper.getvalue(), gpu=False)
+        wrapper.define_kernel(
+            kernel_name,
+            compile_wrapper.getvalue(),
+            gpu=False,
+            cpp_definition=kernel_definition,
+        )
         return kernel_name
 
     def flush(self):
@@ -5173,12 +5274,8 @@ class KernelGroup:
     def call_kernel(self, wrapper, kernel_name):
         _, call_args, arg_types = self.args.cpp_argdefs()
         wrapper.generate_kernel_call(
-            kernel_name, call_args, gpu=False, triton=False, arg_types=arg_types
+            kernel_name, call_args, triton=False, arg_types=arg_types
         )
-
-
-class CppWrapperKernelGroup(KernelGroup):
-    pass
 
 
 class WorkSharing:
@@ -5348,38 +5445,53 @@ class LoopNest:
     @cache_on_self
     def max_parallel_depth(self):
         """
-        Maximal allowed depth for parallelism:
-        1) Levels without splitting and
-        2) All reduction or non-reduction levels
-        When the loop is split at the top level, the max depth is 1.
+        Maximal allowed depth for parallelism: All reduction or non-reduction levels.
+        When the range of the first inner loop beyond the maximum parallel depth is much
+        larger than the range of all outer loops within the maximum parallel depth,
+        change the starting depth of parallelism to the first inner loop and recalculate
+        the maximum parallel depth.
         """
         if self.loops is None:
-            return 0
+            return ParallelDepth(parallel_depth=0, start_depth=0)
 
+        start_depth = 0
         max_depth = 0
         is_reduction = self.loops[0].is_reduction
+        loop_sizes = sympy.Integer(1)
         for loop in self.loops:
             if loop.is_reduction != is_reduction:
                 break
+            loop_sizes = loop_sizes * loop.size
             max_depth += 1
-        return max_depth
 
-    def is_reduction_only(self):
-        """
-        Whether all the loops are for reduction. Reduction loops
-        are always the inner most ones.
-        """
-        return self.loops is not None and self.loops[0].is_reduction
+        # When the range of the first inner loop is much larger than the range of all outer loops,
+        # change `start_depth` to the first inner loop and recalculate `max_depth`.
+        if (
+            max_depth < len(self.loops)
+            and isinstance(loop_sizes, sympy.Integer)
+            and isinstance(self.loops[max_depth].size, sympy.Integer)
+            and loop_sizes * 300 < self.loops[max_depth].size
+        ):
+            start_depth = max_depth
+            max_depth = 0
+            is_reduction = self.loops[start_depth].is_reduction
+            for i in range(start_depth, len(self.loops)):
+                if self.loops[i].is_reduction != is_reduction:
+                    break
+                max_depth += 1
+        return ParallelDepth(parallel_depth=max_depth, start_depth=start_depth)
 
     def mark_parallel(self, par_depth):
-        assert par_depth <= self.max_parallel_depth(), (
+        assert par_depth.parallel_depth <= self.max_parallel_depth().parallel_depth, (
             "Parallel depth cannot exceed the maximal allowed parallel depth"
         )
         assert self.loops is not None
-        assert len(self.loops) >= par_depth
-        loop = self.loops[0]
-        loop.parallel = par_depth
-        for i in range(1, par_depth):
+        assert len(self.loops) >= par_depth.parallel_depth
+        loop = self.loops[par_depth.start_depth]
+        loop.parallel = par_depth.parallel_depth
+        if loop.is_reduction:
+            metrics.parallel_reduction_count += 1
+        for i in range(par_depth.start_depth + 1, par_depth.parallel_depth):
             self.loops[i].collapsed = True
 
     def tile(self, depth, factor):
